@@ -1,0 +1,2 @@
+# No third-party dependencies.
+# mac_cleaner.py uses only the Python standard library.
