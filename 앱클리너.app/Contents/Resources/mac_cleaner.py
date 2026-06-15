@@ -253,9 +253,17 @@ def get_installed_apps() -> dict:
 
 # 잔여파일이 숨어있는 경로들
 ORPHAN_SEARCH_DIRS = [
+    HOME / "Library" / "Application Support",
+    HOME / "Library" / "Preferences",
     HOME / "Library" / "Caches",
     HOME / "Library" / "Logs",
+    HOME / "Library" / "Containers",
+    HOME / "Library" / "Group Containers",
     HOME / "Library" / "LaunchAgents",
+    Path("/Library/LaunchAgents"),
+    Path("/Library/LaunchDaemons"),
+    Path("/Library/Application Support"),
+    Path("/Library/Preferences"),
 ]
 
 OS_UPDATE_TARGETS = [
@@ -555,122 +563,105 @@ def gather_scan_results():
 class CleanerGUI:
     def __init__(self):
         try:
-            from AppKit import (
-                NSApplication,
-                NSApplicationActivationPolicyRegular,
-                NSBackingStoreBuffered,
-                NSButton,
-                NSFont,
-                NSMakeRect,
-                NSScrollView,
-                NSWindow,
-                NSWindowStyleMaskClosable,
-                NSWindowStyleMaskMiniaturizable,
-                NSWindowStyleMaskResizable,
-                NSWindowStyleMaskTitled,
-                NSTextField,
-                NSTextView,
-                NSAlert,
-            )
+            import tkinter as tk
+            from tkinter import messagebox, scrolledtext
         except Exception as e:
-            raise RuntimeError(f"AppKit를 사용할 수 없습니다: {e}") from e
+            raise RuntimeError(f"tkinter를 사용할 수 없습니다: {e}") from e
 
-        self.NSApplication = NSApplication
-        self.NSApplicationActivationPolicyRegular = NSApplicationActivationPolicyRegular
-        self.NSBackingStoreBuffered = NSBackingStoreBuffered
-        self.NSButton = NSButton
-        self.NSFont = NSFont
-        self.NSMakeRect = NSMakeRect
-        self.NSScrollView = NSScrollView
-        self.NSWindow = NSWindow
-        self.NSWindowStyleMaskClosable = NSWindowStyleMaskClosable
-        self.NSWindowStyleMaskMiniaturizable = NSWindowStyleMaskMiniaturizable
-        self.NSWindowStyleMaskResizable = NSWindowStyleMaskResizable
-        self.NSWindowStyleMaskTitled = NSWindowStyleMaskTitled
-        self.NSTextField = NSTextField
-        self.NSTextView = NSTextView
-        self.NSAlert = NSAlert
+        self.tk = tk
+        self.messagebox = messagebox
+        self.scrolledtext = scrolledtext
+        self.root = tk.Tk()
+        self.root.title("앱클리너")
+        self.root.geometry("860x640")
+        self.root.minsize(760, 560)
 
-        self.app = self.NSApplication.sharedApplication()
-        self.app.setActivationPolicy_(self.NSApplicationActivationPolicyRegular)
+        self._build_ui()
 
-        style = (
-            self.NSWindowStyleMaskTitled
-            | self.NSWindowStyleMaskClosable
-            | self.NSWindowStyleMaskResizable
-            | self.NSWindowStyleMaskMiniaturizable
+    def _build_ui(self):
+        tk = self.tk
+        self.root.configure(bg="#edf3ef")
+
+        outer = tk.Frame(self.root, bg="#edf3ef", padx=18, pady=18)
+        outer.pack(fill="both", expand=True)
+
+        header = tk.Frame(outer, bg="#edf3ef")
+        header.pack(fill="x")
+        tk.Label(
+            header,
+            text="앱클리너",
+            font=("Helvetica Neue", 26, "bold"),
+            bg="#edf3ef",
+            fg="#14433a",
+        ).pack(anchor="w")
+        tk.Label(
+            header,
+            text="한 번 클릭으로 스캔하고, 결과를 보고, 마우스로 계속 진행할 수 있습니다.",
+            font=("Helvetica Neue", 12),
+            bg="#edf3ef",
+            fg="#4d6c64",
+        ).pack(anchor="w", pady=(4, 14))
+
+        controls = tk.Frame(outer, bg="#edf3ef")
+        controls.pack(fill="x", pady=(0, 12))
+
+        self.scan_button = tk.Button(
+            controls,
+            text="스캔 및 정리",
+            command=self.start_scan,
+            font=("Helvetica Neue", 13, "bold"),
+            bg="#1f8f7a",
+            fg="white",
+            activebackground="#176e5d",
+            activeforeground="white",
+            relief="flat",
+            padx=18,
+            pady=10,
         )
-        self.window = self.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            self.NSMakeRect(0, 0, 860, 640),
-            style,
-            self.NSBackingStoreBuffered,
-            False,
+        self.scan_button.pack(side="left")
+
+        self.status_var = tk.StringVar(value="대기 중")
+        tk.Label(
+            controls,
+            textvariable=self.status_var,
+            font=("Helvetica Neue", 12),
+            bg="#edf3ef",
+            fg="#4d6c64",
+        ).pack(side="left", padx=16)
+
+        self.text = self.scrolledtext.ScrolledText(
+            outer,
+            wrap="word",
+            height=24,
+            font=("Menlo", 12),
+            bg="#f8fbf9",
+            fg="#18302c",
+            insertbackground="#18302c",
+            relief="solid",
+            borderwidth=1,
         )
-        self.window.setTitle_("앱클리너")
-        self.window.center()
-        self.window.setReleasedWhenClosed_(False)
+        self.text.pack(fill="both", expand=True)
+        self._append("스캔 버튼을 눌러 시작하세요.")
 
-        content = self.window.contentView()
-        content.setWantsLayer_(True)
-
-        title = self.NSTextField.labelWithString_("앱클리너")
-        title.setFrame_(self.NSMakeRect(20, 590, 260, 32))
-        title.setFont_(self.NSFont.boldSystemFontOfSize_(26))
-        title.setTextColor_(self._color(0.08, 0.27, 0.23))
-        content.addSubview_(title)
-
-        subtitle = self.NSTextField.labelWithString_(
-            "실행 버튼을 누르면 스캔 결과를 보여주고, 계속 진행할지 묻습니다."
+        footer = tk.Label(
+            outer,
+            text="주의: 삭제 작업이 포함됩니다. 결과를 확인한 뒤 계속 여부를 선택하세요.",
+            font=("Helvetica Neue", 11),
+            bg="#edf3ef",
+            fg="#7a8f87",
         )
-        subtitle.setFrame_(self.NSMakeRect(20, 562, 760, 22))
-        subtitle.setFont_(self.NSFont.systemFontOfSize_(12))
-        subtitle.setTextColor_(self._color(0.3, 0.42, 0.39))
-        content.addSubview_(subtitle)
-
-        self.button = self.NSButton.alloc().initWithFrame_(self.NSMakeRect(20, 514, 130, 34))
-        self.button.setTitle_("실행")
-        self.button.setBezelStyle_(1)
-        self.button.setTarget_(self)
-        self.button.setAction_("startScan:")
-        content.addSubview_(self.button)
-
-        self.status = self.NSTextField.labelWithString_("대기 중")
-        self.status.setFrame_(self.NSMakeRect(164, 519, 240, 20))
-        self.status.setFont_(self.NSFont.systemFontOfSize_(12))
-        self.status.setTextColor_(self._color(0.3, 0.42, 0.39))
-        content.addSubview_(self.status)
-
-        self.scroll = self.NSScrollView.alloc().initWithFrame_(self.NSMakeRect(20, 52, 820, 448))
-        self.scroll.setHasVerticalScroller_(True)
-        self.scroll.setBorderType_(1)
-
-        self.textView = self.NSTextView.alloc().initWithFrame_(self.NSMakeRect(0, 0, 820, 448))
-        self.textView.setEditable_(False)
-        self.textView.setSelectable_(True)
-        self.textView.setRichText_(False)
-        self.textView.setAutomaticQuoteSubstitutionEnabled_(False)
-        self.textView.setFont_(self.NSFont.fontWithName_size_("Menlo", 12) or self.NSFont.systemFontOfSize_(12))
-        self.textView.setString_("실행 버튼을 누르면 여기에 결과가 표시됩니다.")
-        self.scroll.setDocumentView_(self.textView)
-        content.addSubview_(self.scroll)
-
-        footer = self.NSTextField.labelWithString_(
-            "주의: 삭제 작업이 포함됩니다. 결과를 확인한 뒤 계속 여부를 선택하세요."
-        )
-        footer.setFrame_(self.NSMakeRect(20, 20, 820, 20))
-        footer.setFont_(self.NSFont.systemFontOfSize_(11))
-        footer.setTextColor_(self._color(0.48, 0.56, 0.53))
-        content.addSubview_(footer)
+        footer.pack(anchor="w", pady=(10, 0))
 
     def _append(self, text: str):
         text = strip_ansi(text)
-        current = self.textView.string() or ""
-        if current:
-            current += "\n"
-        self.textView.setString_(current + text)
+        self.text.configure(state="normal")
+        self.text.insert("end", text + "\n")
+        self.text.see("end")
+        self.text.configure(state="disabled")
 
     def _set_status(self, text: str):
-        self.status.setStringValue_(text)
+        self.status_var.set(text)
+        self.root.update_idletasks()
 
     def _render_preview(self, os_updates, cache_results, orphans):
         lines = []
@@ -683,24 +674,19 @@ class CleanerGUI:
             print_orphan_preview(orphans, emit=emit)
         return "\n".join(lines).strip()
 
-    def _color(self, r, g, b):
-        from AppKit import NSColor
-        return NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, 1.0)
-
-    def _ask_continue(self, total_all: int) -> bool:
-        alert = self.NSAlert.alloc().init()
-        alert.setMessageText_("확인")
-        alert.setInformativeText_(f"{fmt_size(total_all)}를 삭제합니다. 계속할까요?")
-        alert.addButtonWithTitle_("계속")
-        alert.addButtonWithTitle_("취소")
-        return alert.runModal() == 1000
-
-    def startScan_(self, sender):
-        self.button.setEnabled_(False)
-        self.textView.setString_("")
+    def start_scan(self):
+        self.scan_button.configure(state="disabled")
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.configure(state="disabled")
         self._set_status("스캔 중...")
         self._append("스캔을 시작합니다.")
-        _, _, orphans, os_updates, cache_results = gather_scan_results()
+        threading.Thread(target=self._scan_worker, daemon=True).start()
+
+    def _scan_worker(self):
+        stdout_buf = io.StringIO()
+        with redirect_stdout(stdout_buf):
+            _, _, orphans, os_updates, cache_results = gather_scan_results()
 
         preview = self._render_preview(os_updates, cache_results, orphans)
         total_all = (
@@ -708,6 +694,11 @@ class CleanerGUI:
             + sum(r["size"] for r in cache_results)
             + sum(o["size"] for o in orphans)
         )
+        self.root.after(0, lambda: self._on_scan_complete(stdout_buf.getvalue(), preview, os_updates, cache_results, orphans, total_all))
+
+    def _on_scan_complete(self, scan_output, preview, os_updates, cache_results, orphans, total_all):
+        if scan_output.strip():
+            self._append(scan_output.rstrip())
         if preview:
             self._append(preview)
         self._append("")
@@ -716,19 +707,30 @@ class CleanerGUI:
         if total_all == 0:
             self._append("정리할 항목이 없습니다.")
             self._set_status("완료")
-            self.button.setEnabled_(True)
+            self.scan_button.configure(state="normal")
             return
 
         self._set_status("확인 대기")
-        ok = self._ask_continue(total_all)
+        ok = self.messagebox.askyesno(
+            "확인",
+            f"{fmt_size(total_all)}를 삭제합니다. 계속할까요?",
+            parent=self.root,
+        )
         if not ok:
             self._append("사용자가 취소했습니다.")
             self._set_status("취소됨")
-            self.button.setEnabled_(True)
+            self.scan_button.configure(state="normal")
             return
 
         self._append("정리 중...")
         self._set_status("정리 중...")
+        threading.Thread(
+            target=self._clean_worker,
+            args=(os_updates, cache_results, orphans),
+            daemon=True,
+        ).start()
+
+    def _clean_worker(self, os_updates, cache_results, orphans):
         stdout_buf = io.StringIO()
         with redirect_stdout(stdout_buf):
             freed = 0
@@ -738,18 +740,18 @@ class CleanerGUI:
                 freed += clean_caches(cache_results)
             if orphans:
                 freed += clean_orphans(orphans)
-        output = stdout_buf.getvalue()
+        self.root.after(0, lambda: self._on_clean_complete(stdout_buf.getvalue(), freed))
+
+    def _on_clean_complete(self, output, freed):
         if output.strip():
             self._append(output.rstrip())
         self._append("")
         self._append(f"완료! 총 {fmt_size(freed)} 확보했습니다.")
         self._set_status("완료")
-        self.button.setEnabled_(True)
+        self.scan_button.configure(state="normal")
 
     def run(self):
-        self.window.makeKeyAndOrderFront_(None)
-        self.app.activateIgnoringOtherApps_(True)
-        self.app.run()
+        self.root.mainloop()
 
 
 def parse_args():
