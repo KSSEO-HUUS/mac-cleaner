@@ -71,6 +71,18 @@ source .venv/bin/activate
 python3 mac_cleaner.py
 ```
 
+### 소스와 실행파일 분리
+
+- `mac_cleaner.py` 는 수정용 원본 소스입니다.
+- `앱클리너.app` 는 더블클릭용 실행 파일입니다.
+- 소스를 바꾼 뒤 앱을 다시 만들려면 `./build_app.command` 를 실행하세요.
+
+### 설치파일 만들기
+
+- `./build_installer.command` 를 실행하면 `/Applications`에 설치하는 `앱클리너.pkg` 를 만듭니다.
+- 설치파일은 `build-installer/앱클리너.pkg` 에 생성됩니다.
+- 앱이 먼저 없으면 자동으로 앱부터 빌드한 뒤 설치파일을 만듭니다.
+
 ## 제외되는 항목
 
 다음 계열은 기본적으로 건너뜁니다.

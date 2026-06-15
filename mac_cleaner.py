@@ -12,6 +12,8 @@ import subprocess
 import threading
 import io
 import re
+import sys
+import traceback
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -34,6 +36,15 @@ def dim(s):    return f"{C.DIM}{s}{C.RESET}"
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+DEBUG_LOG = Path("/tmp/앱클리너.log")
+
+
+def debug_log(message: str):
+    try:
+        with DEBUG_LOG.open("a", encoding="utf-8") as f:
+            f.write(f"{message}\n")
+    except Exception:
+        pass
 
 
 def strip_ansi(text: str) -> str:
@@ -563,7 +574,10 @@ class CleanerGUI:
                 NSFont,
                 NSMakeRect,
                 NSScrollView,
+                NSRunningApplication,
                 NSWindow,
+                NSApplicationActivateAllWindows,
+                NSApplicationActivateIgnoringOtherApps,
                 NSWindowStyleMaskClosable,
                 NSWindowStyleMaskMiniaturizable,
                 NSWindowStyleMaskResizable,
@@ -577,11 +591,14 @@ class CleanerGUI:
 
         self.NSApplication = NSApplication
         self.NSApplicationActivationPolicyRegular = NSApplicationActivationPolicyRegular
+        self.NSApplicationActivateAllWindows = NSApplicationActivateAllWindows
+        self.NSApplicationActivateIgnoringOtherApps = NSApplicationActivateIgnoringOtherApps
         self.NSBackingStoreBuffered = NSBackingStoreBuffered
         self.NSButton = NSButton
         self.NSFont = NSFont
         self.NSMakeRect = NSMakeRect
         self.NSScrollView = NSScrollView
+        self.NSRunningApplication = NSRunningApplication
         self.NSWindow = NSWindow
         self.NSWindowStyleMaskClosable = NSWindowStyleMaskClosable
         self.NSWindowStyleMaskMiniaturizable = NSWindowStyleMaskMiniaturizable
@@ -661,6 +678,7 @@ class CleanerGUI:
         footer.setFont_(self.NSFont.systemFontOfSize_(11))
         footer.setTextColor_(self._color(0.48, 0.56, 0.53))
         content.addSubview_(footer)
+        self.delegate = None
 
     def _append(self, text: str):
         text = strip_ansi(text)
@@ -747,8 +765,51 @@ class CleanerGUI:
         self.button.setEnabled_(True)
 
     def run(self):
+        from AppKit import NSObject
+
+        class AppDelegate(NSObject):
+            def initWithOwner_(self, owner):
+                self = self.init()
+                if self is None:
+                    return None
+                self.owner = owner
+                return self
+
+            def applicationDidFinishLaunching_(self, notification):
+                debug_log("GUI delegate: applicationDidFinishLaunching")
+                self.performSelector_withObject_afterDelay_("showWindow:", None, 0.0)
+
+            def showWindow_(self, sender):
+                debug_log("GUI delegate: showWindow")
+                current_app = self.owner.NSRunningApplication.currentApplication()
+                current_app.activateWithOptions_(
+                    self.owner.NSApplicationActivateAllWindows
+                    | self.owner.NSApplicationActivateIgnoringOtherApps
+                )
+                self.owner.window.makeKeyAndOrderFront_(None)
+                self.owner.window.orderFrontRegardless()
+                self.owner.app.activateIgnoringOtherApps_(True)
+                self.owner.window.makeMainWindow()
+                frame = self.owner.window.frame()
+                debug_log(
+                    "GUI delegate: window frame="
+                    f"({frame.origin.x}, {frame.origin.y}, {frame.size.width}, {frame.size.height}), "
+                    f"isVisible={self.owner.window.isVisible()}"
+                )
+                debug_log("GUI delegate: window ordered front")
+
+            def applicationShouldTerminateAfterLastWindowClosed_(self, sender):
+                return True
+
+        self.delegate = AppDelegate.alloc().initWithOwner_(self)
+        self.app.setDelegate_(self.delegate)
+        self.app.finishLaunching()
+        self.window.center()
+        debug_log("GUI run: window centered")
         self.window.makeKeyAndOrderFront_(None)
+        self.window.orderFrontRegardless()
         self.app.activateIgnoringOtherApps_(True)
+        debug_log("GUI run: window ordered front before app.run()")
         self.app.run()
 
 
@@ -834,13 +895,18 @@ def run_brew():
 def main():
     args = parse_args()
 
-    if args.gui:
+    launched_from_gui = getattr(sys, "frozen", False) and not sys.stdout.isatty()
+
+    if args.gui or launched_from_gui:
         try:
+            debug_log("GUI start: entering CleanerGUI().run()")
             CleanerGUI().run()
         except Exception as e:
+            debug_log("GUI error:\n" + traceback.format_exc())
             print(red(f"GUI 실행 실패: {e}"))
             print(yellow("터미널 모드로 계속합니다."))
         else:
+            debug_log("GUI start: returned from run()")
             return
 
     print()

@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+SOURCE="/Applications/HuusCleaner.app"
+TARGET="/Applications/앱클리너.app"
+
+if [ -d "$SOURCE" ]; then
+  if [ -e "$TARGET" ]; then
+    rm -rf "$TARGET"
+  fi
+  mv "$SOURCE" "$TARGET"
+fi
+
+exit 0
