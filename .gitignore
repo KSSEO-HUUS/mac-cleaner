@@ -11,8 +11,6 @@ pyinstaller-spec/
 build-onefile-build/
 build-onefile-dist/
 build-onefile-spec/
-build-installer/
-*.pkg
 HuusCleaner.app/
 앱클리너.app/
 *클리어.app/
