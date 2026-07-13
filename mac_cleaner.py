@@ -453,6 +453,54 @@ CACHE_TARGETS = [
         "paths": [HOME / ".gradle" / "caches"],
         "mode": "self",
     },
+    {
+        "name": "Homebrew 캐시",
+        "desc": "brew 다운로드/빌드 캐시",
+        "paths": [HOME / "Library" / "Caches" / "Homebrew"],
+        "mode": "self",
+    },
+    {
+        "name": "Yarn 캐시",
+        "desc": "yarn 패키지 캐시",
+        "paths": [HOME / "Library" / "Caches" / "Yarn"],
+        "mode": "self",
+    },
+    {
+        "name": "pnpm 캐시",
+        "desc": "pnpm 패키지 저장소",
+        "paths": [HOME / "Library" / "pnpm" / "store", HOME / ".local" / "share" / "pnpm" / "store"],
+        "mode": "self",
+    },
+    {
+        "name": "CocoaPods 캐시",
+        "desc": "CocoaPods 다운로드 캐시",
+        "paths": [HOME / "Library" / "Caches" / "CocoaPods"],
+        "mode": "self",
+    },
+    {
+        "name": "Xcode Archives",
+        "desc": "Xcode 아카이브 빌드",
+        "paths": [HOME / "Library" / "Developer" / "Xcode" / "Archives"],
+        "mode": "children",
+    },
+    {
+        "name": "iOS/iPadOS 기기 백업",
+        "desc": "MobileSync 백업 (필요한 백업이 없는지 확인)",
+        "paths": [HOME / "Library" / "Application Support" / "MobileSync" / "Backup"],
+        "mode": "children",
+    },
+    {
+        "name": "Mail 다운로드",
+        "desc": "메일 첨부파일 다운로드 캐시",
+        "paths": [HOME / "Library" / "Containers" / "com.apple.mail" / "Data" / "Library" / "Mail Downloads"],
+        "mode": "children",
+    },
+    {
+        "name": "시스템 업데이트 캐시",
+        "desc": "/Library/Caches/com.apple.SoftwareUpdate",
+        "paths": [Path("/Library/Caches/com.apple.SoftwareUpdate")],
+        "mode": "children",
+    },
 ]
 
 def scan_caches() -> list[dict]:
