@@ -7,6 +7,7 @@ mac_cleaner.py - macOS 가비지 파일 자동 정리 도구
 import os
 import argparse
 import plistlib
+import shlex
 import shutil
 import subprocess
 import threading
@@ -517,6 +518,206 @@ def scan_caches() -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════
+# 3-b. 관리자 권한이 필요한 시스템 항목 (sudo)
+# ══════════════════════════════════════════════════════════
+# 현재 사용자 권한으로는 지울 수 없어, 삭제 시 관리자 암호를 받아야 한다.
+
+ADMIN_TARGETS = [
+    {
+        "name": "시스템 로그",
+        "desc": "/private/var/log (관리자 권한 필요)",
+        "paths": [Path("/private/var/log")],
+        "mode": "children",
+    },
+    {
+        "name": "SoftwareUpdate 자산",
+        "desc": "MobileAsset 소프트웨어 업데이트 자산 (SIP로 막힐 수 있음)",
+        "paths": [Path("/System/Library/AssetsV2/com_apple_MobileAsset_SoftwareUpdate")],
+        "mode": "children",
+    },
+]
+
+
+def scan_admin_targets() -> list[dict]:
+    """관리자 권한이 필요한 시스템 항목을 스캔한다. 존재하면 표시(용량은 근사치)."""
+    results = []
+    for t in ADMIN_TARGETS:
+        existing = [p for p in t["paths"] if p.exists()]
+        if not existing:
+            continue
+        size = 0
+        for p in existing:
+            try:
+                size += get_effective_size(p)
+            except (PermissionError, OSError):
+                pass
+        results.append({**t, "existing_paths": existing, "size": size})
+    return results
+
+
+# ══════════════════════════════════════════════════════════
+# 3-c. 외부 도구 명령으로 정리하는 항목
+# ══════════════════════════════════════════════════════════
+# 용량을 미리 계산하기 어렵거나, 전용 명령으로 비우는 게 안전한 항목들.
+# check: 해당 실행파일이 있을 때만 노출(None 이면 항상).
+# admin: 관리자 권한 필요. danger: 되돌릴 수 없는 위험 항목.
+
+COMMAND_TARGETS = [
+    {
+        "name": "Homebrew cleanup",
+        "desc": "brew cleanup -s + 다운로드 캐시 삭제",
+        "check": "brew",
+        "cmd": 'brew cleanup -s; rm -rf "$(brew --cache)"',
+        "admin": False,
+        "danger": False,
+    },
+    {
+        "name": "사용하지 않는 시뮬레이터",
+        "desc": "xcrun simctl delete unavailable",
+        "check": "xcrun",
+        "cmd": "xcrun simctl delete unavailable",
+        "admin": False,
+        "danger": False,
+    },
+    {
+        "name": "Docker 정리 (볼륨 포함)",
+        "desc": "docker system prune -af --volumes — 볼륨/이미지까지 삭제(위험)",
+        "check": "docker",
+        "cmd": "docker system prune -af --volumes",
+        "admin": False,
+        "danger": True,
+    },
+    {
+        "name": "Time Machine 로컬 스냅샷",
+        "desc": "tmutil thinlocalsnapshots (관리자 권한 필요)",
+        "check": None,
+        "cmd": "tmutil thinlocalsnapshots / 999999999999 4",
+        "admin": True,
+        "danger": False,
+    },
+]
+
+
+def scan_command_targets() -> list[dict]:
+    results = []
+    for t in COMMAND_TARGETS:
+        check = t.get("check")
+        if check and not shutil.which(check):
+            continue
+        results.append(dict(t))
+    return results
+
+
+# ══════════════════════════════════════════════════════════
+# 3-d. 스캔 결과를 선택 가능한 단일 목록(entry)으로 통합
+# ══════════════════════════════════════════════════════════
+# 각 entry: kind, category, label, desc, size(int|None), target, default, admin, danger
+
+def gather_entries() -> list[dict]:
+    installed_apps, name_to_id = get_installed_apps()
+    orphans = find_orphans(installed_apps, name_to_id)
+    os_updates = scan_os_update_leftovers()
+    cache_results = scan_caches()
+    admin_results = scan_admin_targets()
+    command_results = scan_command_targets()
+
+    entries = []
+    for r in os_updates:
+        entries.append({"kind": "path", "category": "🧩 OS 업데이트 잔여물",
+                        "label": r["name"], "desc": r["desc"], "size": r["size"],
+                        "target": r, "default": True, "admin": False, "danger": False})
+    for r in cache_results:
+        entries.append({"kind": "path", "category": "🗂 일반 캐시 / 로그",
+                        "label": r["name"], "desc": r["desc"], "size": r["size"],
+                        "target": r, "default": True, "admin": False, "danger": False})
+    for o in orphans:
+        entries.append({"kind": "orphan", "category": "👻 삭제된 앱 잔여파일",
+                        "label": o["path"].name, "desc": str(o["path"].parent), "size": o["size"],
+                        "target": o, "default": True, "admin": False, "danger": False})
+    for r in command_results:
+        admin = r.get("admin", False)
+        danger = r.get("danger", False)
+        entries.append({"kind": "command", "category": "🛠 도구 명령 정리",
+                        "label": r["name"], "desc": r["desc"], "size": None,
+                        "target": r, "default": (not admin and not danger),
+                        "admin": admin, "danger": danger})
+    for r in admin_results:
+        entries.append({"kind": "admin_path", "category": "🔒 시스템 (관리자 권한)",
+                        "label": r["name"], "desc": r["desc"], "size": r["size"],
+                        "target": r, "default": False, "admin": True, "danger": False})
+    return entries
+
+
+# ══════════════════════════════════════════════════════════
+# 3-e. entry 실행 (사용자 / 명령 / 관리자 배치)
+# ══════════════════════════════════════════════════════════
+
+def run_command_target(t: dict, emit=print):
+    emit(f"  → {t['name']}")
+    try:
+        r = subprocess.run(t["cmd"], shell=True, capture_output=True, text=True, timeout=1200)
+        if r.returncode == 0:
+            emit(green(f"    ✓ {t['name']}"))
+        else:
+            emit(red(f"    ✗ {t['name']}: {(r.stderr or '').strip()[:200]}"))
+    except Exception as e:
+        emit(red(f"    ✗ {t['name']}: {e}"))
+
+
+def run_admin_batch(admin_paths: list[dict], admin_cmds: list[dict], emit=print) -> bool:
+    """관리자 권한 항목을 한 번의 암호 입력으로 일괄 실행한다."""
+    parts = []
+    for t in admin_paths:
+        for p in t.get("existing_paths", t["paths"]):
+            q = shlex.quote(str(p))
+            if t.get("mode") == "self":
+                parts.append(f"rm -rf {q} 2>/dev/null || true")
+            else:  # children
+                parts.append(f"rm -rf {q}/* 2>/dev/null || true")
+    for t in admin_cmds:
+        parts.append(f"{t['cmd']} 2>/dev/null || true")
+
+    if not parts:
+        return True
+
+    body = " ; ".join(parts)
+    apple = body.replace("\\", "\\\\").replace('"', '\\"')
+    script = f'do shell script "{apple}" with administrator privileges'
+    emit("  → 관리자 항목 정리 (암호 입력 필요)")
+    try:
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=1800)
+        if r.returncode == 0:
+            emit(green("    ✓ 관리자 항목 정리 완료"))
+            return True
+        emit(red(f"    ✗ 관리자 항목 취소/실패: {(r.stderr or '').strip()[:200]}"))
+        return False
+    except Exception as e:
+        emit(red(f"    ✗ 관리자 항목 실패: {e}"))
+        return False
+
+
+def execute_entries(selected: list[dict], emit=print) -> int:
+    """선택된 entry들을 종류별로 나눠 실행한다. 반환: 사용자 경로에서 확보한 용량."""
+    freed = 0
+    # 1) 사용자 권한 경로/잔여파일 삭제
+    for e in selected:
+        if e["kind"] == "path":
+            freed += clean_caches([e["target"]])
+        elif e["kind"] == "orphan":
+            freed += clean_orphans([e["target"]])
+    # 2) 관리자 불필요 명령
+    for e in selected:
+        if e["kind"] == "command" and not e["target"].get("admin"):
+            run_command_target(e["target"], emit)
+    # 3) 관리자 배치 (경로 rm + 관리자 명령)를 한 번에
+    admin_paths = [e["target"] for e in selected if e["kind"] == "admin_path"]
+    admin_cmds = [e["target"] for e in selected if e["kind"] == "command" and e["target"].get("admin")]
+    if admin_paths or admin_cmds:
+        run_admin_batch(admin_paths, admin_cmds, emit)
+    return freed
+
+
+# ══════════════════════════════════════════════════════════
 # 4. 출력 / UI
 # ══════════════════════════════════════════════════════════
 
@@ -623,6 +824,7 @@ class CleanerGUI:
                 NSMakeRect,
                 NSScrollView,
                 NSRunningApplication,
+                NSView,
                 NSWindow,
                 NSApplicationActivateAllWindows,
                 NSApplicationActivateIgnoringOtherApps,
@@ -647,6 +849,7 @@ class CleanerGUI:
         self.NSMakeRect = NSMakeRect
         self.NSScrollView = NSScrollView
         self.NSRunningApplication = NSRunningApplication
+        self.NSView = NSView
         self.NSWindow = NSWindow
         self.NSWindowStyleMaskClosable = NSWindowStyleMaskClosable
         self.NSWindowStyleMaskMiniaturizable = NSWindowStyleMaskMiniaturizable
@@ -692,40 +895,66 @@ class CleanerGUI:
         subtitle.setTextColor_(self._color(0.3, 0.42, 0.39))
         content.addSubview_(subtitle)
 
-        self.button = self.NSButton.alloc().initWithFrame_(self.NSMakeRect(20, 514, 130, 34))
-        self.button.setTitle_("실행")
-        self.button.setBezelStyle_(1)
-        self.button.setTarget_(self)
-        self.button.setAction_("startScan:")
-        content.addSubview_(self.button)
+        def _mk_button(title, x, w, action):
+            b = self.NSButton.alloc().initWithFrame_(self.NSMakeRect(x, 524, w, 32))
+            b.setTitle_(title)
+            b.setBezelStyle_(1)
+            b.setTarget_(self)
+            b.setAction_(action)
+            content.addSubview_(b)
+            return b
+
+        self.button = _mk_button("스캔", 20, 90, "startScan:")
+        self.selectAllButton = _mk_button("전체 선택", 116, 96, "selectAll:")
+        self.deselectAllButton = _mk_button("전체 해제", 218, 96, "deselectAll:")
+        self.deleteButton = _mk_button("선택 삭제", 320, 110, "deleteSelected:")
+        self.deleteButton.setEnabled_(False)
+        self.selectAllButton.setEnabled_(False)
+        self.deselectAllButton.setEnabled_(False)
 
         self.status = self.NSTextField.labelWithString_("대기 중")
-        self.status.setFrame_(self.NSMakeRect(164, 519, 240, 20))
+        self.status.setFrame_(self.NSMakeRect(440, 530, 400, 20))
         self.status.setFont_(self.NSFont.systemFontOfSize_(12))
         self.status.setTextColor_(self._color(0.3, 0.42, 0.39))
         content.addSubview_(self.status)
 
-        self.scroll = self.NSScrollView.alloc().initWithFrame_(self.NSMakeRect(20, 52, 820, 448))
+        # ── 체크박스 선택 목록 (스캔 결과) ──
+        pick_label = self.NSTextField.labelWithString_("정리할 항목을 골라 체크하세요:")
+        pick_label.setFrame_(self.NSMakeRect(20, 500, 500, 18))
+        pick_label.setFont_(self.NSFont.systemFontOfSize_(11))
+        pick_label.setTextColor_(self._color(0.48, 0.56, 0.53))
+        content.addSubview_(pick_label)
+
+        self.scrollCheck = self.NSScrollView.alloc().initWithFrame_(self.NSMakeRect(20, 250, 820, 248))
+        self.scrollCheck.setHasVerticalScroller_(True)
+        self.scrollCheck.setBorderType_(1)
+
+        NSView = self.NSView
+
+        class _FlippedView(NSView):
+            def isFlipped(self):
+                return True
+
+        self.checkContainer = _FlippedView.alloc().initWithFrame_(self.NSMakeRect(0, 0, 800, 248))
+        self.scrollCheck.setDocumentView_(self.checkContainer)
+        content.addSubview_(self.scrollCheck)
+        self.checkboxes = []  # [(NSButton, entry), ...]
+
+        # ── 로그 출력 ──
+        self.scroll = self.NSScrollView.alloc().initWithFrame_(self.NSMakeRect(20, 20, 820, 218))
         self.scroll.setHasVerticalScroller_(True)
         self.scroll.setBorderType_(1)
 
-        self.textView = self.NSTextView.alloc().initWithFrame_(self.NSMakeRect(0, 0, 820, 448))
+        self.textView = self.NSTextView.alloc().initWithFrame_(self.NSMakeRect(0, 0, 820, 218))
         self.textView.setEditable_(False)
         self.textView.setSelectable_(True)
         self.textView.setRichText_(False)
         self.textView.setAutomaticQuoteSubstitutionEnabled_(False)
         self.textView.setFont_(self.NSFont.fontWithName_size_("Menlo", 12) or self.NSFont.systemFontOfSize_(12))
-        self.textView.setString_("실행 버튼을 누르면 여기에 결과가 표시됩니다.")
+        self.textView.setString_("‘스캔’을 누르면 정리 후보가 위 목록에 나타납니다.\n🔒 = 관리자 암호 필요, ⚠️ = 되돌릴 수 없는 위험 항목(기본 해제).")
         self.scroll.setDocumentView_(self.textView)
         content.addSubview_(self.scroll)
 
-        footer = self.NSTextField.labelWithString_(
-            "주의: 삭제 작업이 포함됩니다. 결과를 확인한 뒤 계속 여부를 선택하세요."
-        )
-        footer.setFrame_(self.NSMakeRect(20, 20, 820, 20))
-        footer.setFont_(self.NSFont.systemFontOfSize_(11))
-        footer.setTextColor_(self._color(0.48, 0.56, 0.53))
-        content.addSubview_(footer)
         self.delegate = None
 
     def _append(self, text: str):
@@ -738,79 +967,140 @@ class CleanerGUI:
     def _set_status(self, text: str):
         self.status.setStringValue_(text)
 
-    def _render_preview(self, os_updates, cache_results, orphans):
-        lines = []
-        emit = lines.append
-        if os_updates:
-            print_os_update_preview(os_updates, emit=emit)
-        if cache_results:
-            print_cache_preview(cache_results, emit=emit)
-        if orphans:
-            print_orphan_preview(orphans, emit=emit)
-        return "\n".join(lines).strip()
-
     def _color(self, r, g, b):
         from AppKit import NSColor
         return NSColor.colorWithCalibratedRed_green_blue_alpha_(r, g, b, 1.0)
 
-    def _ask_continue(self, total_all: int) -> bool:
+    def _confirm(self, message: str) -> bool:
         alert = self.NSAlert.alloc().init()
         alert.setMessageText_("확인")
-        alert.setInformativeText_(f"{fmt_size(total_all)}를 삭제합니다. 계속할까요?")
+        alert.setInformativeText_(message)
         alert.addButtonWithTitle_("계속")
         alert.addButtonWithTitle_("취소")
         return alert.runModal() == 1000
 
+    def _alert(self, message: str):
+        alert = self.NSAlert.alloc().init()
+        alert.setMessageText_("앱클리너")
+        alert.setInformativeText_(message)
+        alert.addButtonWithTitle_("확인")
+        alert.runModal()
+
+    def _render_checkboxes(self, entries):
+        # 이전 항목 제거
+        for sub in list(self.checkContainer.subviews()):
+            sub.removeFromSuperview()
+        self.checkboxes = []
+
+        row_h = 26
+        width = 760
+        y = 6
+        last_cat = None
+        for e in entries:
+            if e["category"] != last_cat:
+                last_cat = e["category"]
+                hdr = self.NSTextField.labelWithString_(last_cat)
+                hdr.setFrame_(self.NSMakeRect(8, y, width, 20))
+                hdr.setFont_(self.NSFont.boldSystemFontOfSize_(13))
+                hdr.setTextColor_(self._color(0.08, 0.27, 0.23))
+                self.checkContainer.addSubview_(hdr)
+                y += row_h
+
+            if e["size"] is None:
+                size_txt = "명령"
+            else:
+                size_txt = fmt_size(e["size"])
+            mark = "  ⚠️" if e["danger"] else ("  🔒" if e.get("admin") else "")
+            cb = self.NSButton.alloc().initWithFrame_(self.NSMakeRect(24, y, width, 22))
+            cb.setButtonType_(3)  # NSSwitchButton (체크박스)
+            cb.setTitle_(f"{e['label']}  —  {size_txt}{mark}")
+            cb.setState_(1 if e["default"] else 0)
+            self.checkContainer.addSubview_(cb)
+            self.checkboxes.append((cb, e))
+            y += row_h
+
+        total_h = y + 8
+        visible_h = self.scrollCheck.contentSize().height
+        self.checkContainer.setFrame_(self.NSMakeRect(0, 0, 800, max(total_h, visible_h)))
+
+    def selectAll_(self, sender):
+        for cb, _e in self.checkboxes:
+            cb.setState_(1)
+
+    def deselectAll_(self, sender):
+        for cb, _e in self.checkboxes:
+            cb.setState_(0)
+
     def startScan_(self, sender):
         self.button.setEnabled_(False)
+        self.deleteButton.setEnabled_(False)
+        self.selectAllButton.setEnabled_(False)
+        self.deselectAllButton.setEnabled_(False)
         self.textView.setString_("")
         self._set_status("스캔 중...")
         self._append("스캔을 시작합니다.")
-        _, _, orphans, os_updates, cache_results = gather_scan_results()
 
-        preview = self._render_preview(os_updates, cache_results, orphans)
-        total_all = (
-            sum(r["size"] for r in os_updates)
-            + sum(r["size"] for r in cache_results)
-            + sum(o["size"] for o in orphans)
-        )
-        if preview:
-            self._append(preview)
-        self._append("")
-        self._append(f"총 확보 가능: {fmt_size(total_all)}")
+        entries = gather_entries()
+        self._entries = entries
+        self._render_checkboxes(entries)
 
-        if total_all == 0:
+        total_all = sum(e["size"] for e in entries if e["size"])
+        n_admin = sum(1 for e in entries if e.get("admin"))
+        n_cmd = sum(1 for e in entries if e["kind"] == "command")
+        self._append(f"후보 {len(entries)}개 · 즉시 확보 가능 약 {fmt_size(total_all)}"
+                     + (f" · 명령 {n_cmd}개" if n_cmd else "")
+                     + (f" · 관리자 {n_admin}개" if n_admin else ""))
+        self._append("원하는 항목을 체크한 뒤 ‘선택 삭제’를 누르세요.")
+
+        self.button.setEnabled_(True)
+        if entries:
+            self.deleteButton.setEnabled_(True)
+            self.selectAllButton.setEnabled_(True)
+            self.deselectAllButton.setEnabled_(True)
+            self._set_status(f"{len(entries)}개 항목 · 선택 대기")
+        else:
+            self._set_status("정리할 항목 없음")
             self._append("정리할 항목이 없습니다.")
-            self._set_status("완료")
-            self.button.setEnabled_(True)
+
+    def deleteSelected_(self, sender):
+        selected = [e for (cb, e) in self.checkboxes if cb.state() == 1]
+        if not selected:
+            self._alert("선택된 항목이 없습니다.")
             return
 
-        self._set_status("확인 대기")
-        ok = self._ask_continue(total_all)
-        if not ok:
+        total = sum(e["size"] for e in selected if e["size"])
+        has_admin = any(e.get("admin") for e in selected)
+        has_danger = any(e["danger"] for e in selected)
+
+        msg = f"{fmt_size(total)}(+명령 항목)를 삭제합니다. 계속할까요?"
+        if has_admin:
+            msg += "\n\n🔒 관리자 암호 입력창이 뜰 수 있습니다."
+        if has_danger:
+            msg += "\n\n⚠️ Docker 볼륨/이미지 등 되돌릴 수 없는 항목이 포함되어 있습니다."
+        if not self._confirm(msg):
             self._append("사용자가 취소했습니다.")
-            self._set_status("취소됨")
-            self.button.setEnabled_(True)
             return
 
-        self._append("정리 중...")
+        self.button.setEnabled_(False)
+        self.deleteButton.setEnabled_(False)
         self._set_status("정리 중...")
+        self._append("")
+        self._append("정리 중...")
+
         stdout_buf = io.StringIO()
         with redirect_stdout(stdout_buf):
-            freed = 0
-            if os_updates:
-                freed += clean_caches(os_updates)
-            if cache_results:
-                freed += clean_caches(cache_results)
-            if orphans:
-                freed += clean_orphans(orphans)
+            freed = execute_entries(selected)
         output = stdout_buf.getvalue()
         if output.strip():
-            self._append(output.rstrip())
+            self._append(strip_ansi(output.rstrip()))
+
         self._append("")
-        self._append(f"완료! 총 {fmt_size(freed)} 확보했습니다.")
-        self._set_status("완료")
+        self._append(f"완료! 사용자 항목에서 {fmt_size(freed)} 확보했습니다.")
+        self._set_status("완료 · 재스캔")
         self.button.setEnabled_(True)
+        # 결과 반영을 위해 다시 스캔
+        self.startScan_(None)
+        self._alert(f"정리 완료.\n사용자 항목에서 {fmt_size(freed)}를 확보했습니다.")
 
     def run(self):
         from AppKit import NSObject
@@ -962,96 +1252,79 @@ def main():
     print()
 
     # ── 스캔 ──
-    print("  [1/4] 설치된 앱 목록 수집 중...", end="\r")
-    installed_apps, name_to_id = get_installed_apps()
-    print(f"  [1/4] 설치된 앱 {len(installed_apps)}개 확인       ")
+    print("  스캔 중...", end="\r")
+    entries = gather_entries()
+    print("  스캔 완료.        ")
 
-    print("  [2/4] 잔여파일 탐색 중...", end="\r")
-    orphans = find_orphans(installed_apps, name_to_id)
-    print(f"  [2/4] 잔여파일 {len(orphans)}개 발견       ")
-
-    print("  [3/4] OS 업데이트 잔여물 스캔 중...", end="\r")
-    os_updates = scan_os_update_leftovers()
-    print(f"  [3/4] OS 업데이트 잔여물 {len(os_updates)}개 발견       ")
-
-    print("  [4/4] 캐시/로그 스캔 중...", end="\r")
-    cache_results = scan_caches()
-    print(f"  [4/4] 캐시 항목 {len(cache_results)}개 확인       ")
-
-    # ── 미리보기 ──
-    if os_updates:
-        print_os_update_preview(os_updates)
-    if cache_results:
-        print_cache_preview(cache_results)
-    if orphans:
-        print_orphan_preview(orphans)
-
-    total_all = (
-        sum(r["size"] for r in os_updates)
-        + sum(r["size"] for r in cache_results)
-        + sum(o["size"] for o in orphans)
-    )
-    print()
-    divider()
-    print(f"  {'총 확보 가능':.<26} {green(fmt_size(total_all).rjust(10))}")
-    divider()
-
-    if total_all == 0:
+    if not entries:
         print(green("\n  ✓ Mac이 깨끗합니다!"))
         return
+
+    # ── 미리보기 (번호 부여) ──
+    last_cat = None
+    for i, e in enumerate(entries, 1):
+        if e["category"] != last_cat:
+            last_cat = e["category"]
+            section(last_cat)
+        size_txt = "명령" if e["size"] is None else fmt_size(e["size"])
+        mark = " ⚠️" if e["danger"] else (" 🔒" if e.get("admin") else "")
+        print(f"  {blue(str(i).rjust(3))}. {e['label']:<30} {yellow(size_txt.rjust(10))}{mark}")
+        print(f"       {dim(e['desc'])}")
+
+    total_all = sum(e["size"] for e in entries if e["size"])
+    print()
+    divider()
+    print(f"  {'즉시 확보 가능':.<26} {green(fmt_size(total_all).rjust(10))}")
+    print(dim("  🔒 = 관리자 암호 필요, ⚠️ = 되돌릴 수 없는 위험 항목"))
+    divider()
 
     # ── 선택 ──
     if args.interactive:
         print()
         print("  정리할 항목 번호 입력")
-        print(dim("  (예: 1 3 101 201 202 / all / q)"))
+        print(dim("  (예: 1 3 5 / all / q)"))
         ans = input("  > ").strip().lower()
-
         if ans in ("q", "quit", ""):
             print(yellow("  취소했습니다."))
             return
-
-        sel_cache, sel_updates, sel_orphan = parse_selection(ans, cache_results, os_updates, orphans)
+        if ans == "all":
+            selected = list(entries)
+        else:
+            idxs = {int(t) for t in ans.split() if t.isdigit()}
+            selected = [e for i, e in enumerate(entries, 1) if i in idxs]
     else:
-        sel_cache, sel_orphan = cache_results, orphans
-        sel_updates = os_updates
+        # 기본: 안전 항목만(관리자/위험 제외). --yes 도 동일 기준.
+        selected = [e for e in entries if e["default"]]
 
-    if not sel_cache and not sel_updates and not sel_orphan:
+    if not selected:
         print(yellow("  선택된 항목이 없습니다."))
         return
 
     # ── 최종 확인 ──
-    preview_total = (
-        sum(r["size"] for r in sel_cache)
-        + sum(r["size"] for r in sel_updates)
-        + sum(o["size"] for o in sel_orphan)
-    )
+    preview_total = sum(e["size"] for e in selected if e["size"])
+    has_admin = any(e.get("admin") for e in selected)
+    has_danger = any(e["danger"] for e in selected)
     if not args.yes:
-        print(f"\n  {yellow(fmt_size(preview_total))} 삭제합니다. 계속할까요? [y/N] ", end="")
+        extra = ""
+        if has_admin:
+            extra += "  🔒 관리자 암호 입력이 필요할 수 있습니다.\n"
+        if has_danger:
+            extra += "  ⚠️ Docker 볼륨 등 되돌릴 수 없는 항목이 포함됩니다.\n"
+        if extra:
+            print("\n" + extra, end="")
+        print(f"\n  {yellow(fmt_size(preview_total))}(+명령 항목) 삭제합니다. 계속할까요? [y/N] ", end="")
         if input().strip().lower() != "y":
             print(yellow("  취소했습니다."))
             return
 
     # ── 실행 ──
     section("🗑  정리 중")
-    freed = 0
-    if sel_updates:
-        freed += clean_caches(sel_updates)
-    if sel_cache:
-        freed += clean_caches(sel_cache)
-    if sel_orphan:
-        freed += clean_orphans(sel_orphan)
-
-    # Homebrew
-    if shutil.which("brew"):
-        print(f"\n  Homebrew 캐시도 정리할까요? [y/N] ", end="")
-        if input().strip().lower() == "y":
-            run_brew()
+    freed = execute_entries(selected)
 
     # ── 결과 ──
     print()
     print(bold("═" * 58))
-    print(bold(green(f"  ✓ 완료!  총 {fmt_size(freed)} 확보")))
+    print(bold(green(f"  ✓ 완료!  사용자 항목에서 {fmt_size(freed)} 확보")))
     print(bold("═" * 58))
     print()
 
